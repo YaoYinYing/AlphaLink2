@@ -26,12 +26,12 @@ from absl import app
 from absl import flags
 from absl import logging
 
-from unifold.data.utils import compress_features
-from unifold.msa import parsers
-from unifold.msa import pipeline
-from unifold.msa import templates
-from unifold.msa.utils import divide_multi_chains
-from unifold.msa.tools import hmmsearch
+from data.utils import compress_features
+from msa import parsers
+from msa import pipeline
+from msa import templates
+from msa.utils import divide_multi_chains
+from msa.tools import hmmsearch
 
 
 logging.set_verbosity(logging.INFO)
@@ -134,7 +134,14 @@ flags.DEFINE_boolean(
 )
 flags.DEFINE_boolean("use_uniprot", True, "Whether to use UniProt MSAs.")
 
+
+
+# added by Yinying
+flags.DEFINE_integer('num_threads', 32, 'Set customized thread number')
+
+
 FLAGS = flags.FLAGS
+
 
 MAX_TEMPLATE_HITS = 20
 
@@ -259,6 +266,7 @@ def main(argv):
         template_featurizer=template_featurizer,
         use_small_bfd=use_small_bfd,
         use_precomputed_msas=FLAGS.use_precomputed_msas,
+        num_threads=FLAGS.num_threads,
     )
 
     fasta_path = FLAGS.fasta_path

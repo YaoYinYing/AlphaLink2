@@ -17,16 +17,21 @@
 import os
 from typing import Any, Mapping, MutableMapping, Optional, Sequence, Union
 from absl import logging
-from unifold.data import residue_constants
-from unifold.msa import msa_identifiers
-from unifold.msa import parsers
-from unifold.msa import templates
-from unifold.msa.tools import hhblits
-from unifold.msa.tools import hhsearch
-from unifold.msa.tools import hmmsearch
-from unifold.msa.tools import jackhmmer
+from data import residue_constants
+from msa import msa_identifiers
+from msa import parsers
+from msa import templates
+from msa.tools import hhblits
+from msa.tools import hhsearch
+from msa.tools import hmmsearch
+from msa.tools import jackhmmer
 import numpy as np
 
+# added by Yinying
+import multiprocessing
+from joblib import Parallel, delayed
+
+# Internal import (7716).
 
 FeatureDict = MutableMapping[str, np.ndarray]
 TemplateSearcher = Union[hhsearch.HHSearch, hmmsearch.Hmmsearch]
@@ -85,14 +90,17 @@ def make_msa_features(msas: Sequence[parsers.Msa]) -> FeatureDict:
     return features
 
 
-def run_msa_tool(
-    msa_runner,
-    input_fasta_path: str,
-    msa_out_path: str,
-    msa_format: str,
-    use_precomputed_msas: bool,
-) -> Mapping[str, Any]:
-    """Runs an MSA tool, checking if output already exists first."""
+# Yinying edited here to change various position args as one tuple for multiprocess tests
+def run_msa_tool(args) -> Mapping[str, Any]:
+    if args == None:
+        return None
+    else:
+        (msa_runner, input_fasta_path, msa_out_path,
+         msa_format, use_precomputed_msas,
+         max_sto_sequences) = args
+        #print(args)
+        """Runs an MSA tool, checking if output already exists first."""
+        """Runs an MSA tool, checking if output already exists first."""
     if not use_precomputed_msas or not os.path.exists(msa_out_path):
         result = msa_runner.query(input_fasta_path)[0]
         with open(msa_out_path, "w") as f:
@@ -100,6 +108,16 @@ def run_msa_tool(
     else:
         logging.warning("Reading MSA from file %s", msa_out_path)
         with open(msa_out_path, "r") as f:
+            result = {msa_format: f.read()}
+    return result
+def read_msa_result(msa_out_path,msa_format,max_sto_sequences):
+    logging.warning('Reading MSA from file %s', msa_out_path)
+    if msa_format == 'sto' and max_sto_sequences > 0:
+        precomputed_msa = parsers.truncate_stockholm_msa(
+            msa_out_path, max_sto_sequences)
+        result = {'sto': precomputed_msa}
+    else:
+        with open(msa_out_path, 'r') as f:
             result = {msa_format: f.read()}
     return result
 
@@ -123,34 +141,53 @@ class DataPipeline:
         mgnify_max_hits: int = 501,
         uniref_max_hits: int = 10000,
         use_precomputed_msas: bool = False,
+        num_threads: int = 10,
     ):
         """Initializes the data pipeline."""
         self._use_small_bfd = use_small_bfd
+        self.num_threads= num_threads
         self.jackhmmer_uniref90_runner = jackhmmer.Jackhmmer(
-            binary_path=jackhmmer_binary_path, database_path=uniref90_database_path
+            binary_path=jackhmmer_binary_path,
+            database_path=uniref90_database_path,
+            n_cpu=self.num_threads // 4 if num_threads>2 else 1
         )
         if use_small_bfd:
             self.jackhmmer_small_bfd_runner = jackhmmer.Jackhmmer(
-                binary_path=jackhmmer_binary_path, database_path=small_bfd_database_path
-            )
+                binary_path=jackhmmer_binary_path,
+                database_path=small_bfd_database_path,
+                n_cpu=(self.num_threads // 4 ) if self.num_threads>2 else self.num_threads-1 )
         else:
             self.hhblits_bfd_uniclust_runner = hhblits.HHBlits(
                 binary_path=hhblits_binary_path,
                 databases=[bfd_database_path, uniclust30_database_path],
+                n_cpu=(self.num_threads // 2 ) if self.num_threads>2 else self.num_threads-1 
             )
         self.jackhmmer_mgnify_runner = jackhmmer.Jackhmmer(
-            binary_path=jackhmmer_binary_path, database_path=mgnify_database_path
+            binary_path=jackhmmer_binary_path,
+            database_path=mgnify_database_path,
+            n_cpu=(self.num_threads // 4) if self.num_threads>2 else 1
         )
+        
         self.jackhmmer_uniprot_runner = jackhmmer.Jackhmmer(
-            binary_path=jackhmmer_binary_path, database_path=uniprot_database_path
+            binary_path=jackhmmer_binary_path, 
+            database_path=uniprot_database_path,
+            n_cpu=(self.num_threads // 4) if self.num_threads>2 else 1
         )
+        
+
+
         self.template_searcher = template_searcher
         self.template_featurizer = template_featurizer
         self.mgnify_max_hits = mgnify_max_hits
         self.uniref_max_hits = uniref_max_hits
         self.use_precomputed_msas = use_precomputed_msas
-
-    def process(self, input_fasta_path: str, msa_output_dir: str) -> FeatureDict:
+    def parallel_msa_joblib(self, func, input_args: list, num_threads: int):
+        return Parallel(n_jobs=num_threads)(delayed(func)(args) for args in input_args)
+    
+    def process(self, 
+                input_fasta_path: str, 
+                msa_output_dir: str,
+                other_args: Optional[tuple] = None) -> FeatureDict:
         """Runs alignment tools on the input sequence and creates features."""
         with open(input_fasta_path) as f:
             input_fasta_str = f.read()
@@ -163,22 +200,82 @@ class DataPipeline:
         input_description = input_descs[0]
         num_res = len(input_sequence)
 
-        uniref90_out_path = os.path.join(msa_output_dir, "uniref90_hits.sto")
-        jackhmmer_uniref90_result = run_msa_tool(
-            self.jackhmmer_uniref90_runner,
-            input_fasta_path,
-            uniref90_out_path,
-            "sto",
-            self.use_precomputed_msas,
-        )
-        mgnify_out_path = os.path.join(msa_output_dir, "mgnify_hits.sto")
-        jackhmmer_mgnify_result = run_msa_tool(
-            self.jackhmmer_mgnify_runner,
-            input_fasta_path,
-            mgnify_out_path,
-            "sto",
-            self.use_precomputed_msas,
-        )
+        self.jackhmmer_uniref90_args=(
+                              self.jackhmmer_uniref90_runner,
+                              input_fasta_path,
+                              os.path.join(
+                                  msa_output_dir,
+                                  'uniref90_hits.sto'),
+                              'sto',
+                              self.use_precomputed_msas,
+                              self.uniref_max_hits
+                          )
+        self.jackhmmer_mgnify_args=(self.jackhmmer_mgnify_runner,
+                                  input_fasta_path,
+                                  os.path.join(
+                                      msa_output_dir,
+                                      'mgnify_hits.sto'),
+                                  'sto',
+                                  self.use_precomputed_msas,
+                                  self.mgnify_max_hits
+                            )
+        if self._use_small_bfd:
+            self.jackhmmer_small_bfd_args=(self.jackhmmer_small_bfd_runner,
+                              input_fasta_path,
+                              os.path.join(msa_output_dir, 'small_bfd_hits.sto'),
+                              'sto',
+                              self.use_precomputed_msas,
+                              0
+                          )
+        else:
+            self.hhblits_bfd_uniclust_args=(
+                                    self.hhblits_bfd_uniclust_runner,
+                                    input_fasta_path,
+                                    os.path.join(msa_output_dir, 'bfd_uniclust_hits.a3m'),
+                                    'a3m',
+                                    self.use_precomputed_msas,
+                                    0
+            )
+        
+
+
+        self.other_args=other_args
+
+        # jackhmmer to reduced bfd
+        if self._use_small_bfd:
+            [
+                jackhmmer_uniref90_result,
+                jackhmmer_mgnify_result,
+                jackhmmer_small_bfd_result,
+                other_msa_task
+            ] = self.parallel_msa_joblib(func=run_msa_tool,
+                                  input_args=[
+                                      self.jackhmmer_uniref90_args,
+                                      self.jackhmmer_mgnify_args,
+                                      self.jackhmmer_small_bfd_args,
+                                      self.other_args],
+                                  num_threads=self.num_threads)
+
+            bfd_msa = parsers.parse_stockholm(jackhmmer_small_bfd_result['sto'])
+
+        # hhblits to full bfd
+        else:
+            [
+                jackhmmer_uniref90_result,
+                jackhmmer_mgnify_result,
+                hhblits_bfd_uniclust_result,
+                other_msa_task
+            ] = self.parallel_msa_joblib(func=run_msa_tool,
+                                  input_args=[
+                                      self.jackhmmer_uniref90_args,
+                                      self.jackhmmer_mgnify_args,
+                                      self.hhblits_bfd_uniclust_args,
+                                      self.other_args],
+                                  num_threads=self.num_threads)
+
+            bfd_msa = parsers.parse_a3m(hhblits_bfd_uniclust_result['a3m'])
+
+
 
         msa_for_templates = jackhmmer_uniref90_result["sto"]
         msa_for_templates = parsers.truncate_stockholm_msa(
@@ -215,26 +312,6 @@ class DataPipeline:
             output_string=pdb_templates_result, input_sequence=input_sequence
         )
 
-        if self._use_small_bfd:
-            bfd_out_path = os.path.join(msa_output_dir, "small_bfd_hits.sto")
-            jackhmmer_small_bfd_result = run_msa_tool(
-                self.jackhmmer_small_bfd_runner,
-                input_fasta_path,
-                bfd_out_path,
-                "sto",
-                self.use_precomputed_msas,
-            )
-            bfd_msa = parsers.parse_stockholm(jackhmmer_small_bfd_result["sto"])
-        else:
-            bfd_out_path = os.path.join(msa_output_dir, "bfd_uniclust_hits.a3m")
-            hhblits_bfd_uniclust_result = run_msa_tool(
-                self.hhblits_bfd_uniclust_runner,
-                input_fasta_path,
-                bfd_out_path,
-                "a3m",
-                self.use_precomputed_msas,
-            )
-            bfd_msa = parsers.parse_a3m(hhblits_bfd_uniclust_result["a3m"])
 
         templates_result = self.template_featurizer.get_templates(
             query_sequence=input_sequence, hits=pdb_template_hits
@@ -264,14 +341,24 @@ class DataPipeline:
     def process_uniprot(
         self, input_fasta_path: str, msa_output_dir: str
     ) -> FeatureDict:
-        uniprot_path = os.path.join(msa_output_dir, "uniprot_hits.sto")
-        uniprot_result = run_msa_tool(
+        
+        self.jackhmmer_uniprot_args=(
             self.jackhmmer_uniprot_runner,
             input_fasta_path,
-            uniprot_path,
+            os.path.join(msa_output_dir, "uniref90_hits.sto"),
             "sto",
             self.use_precomputed_msas,
+            0
         )
+
+        [ uniprot_result,
+            ] = self.parallel_msa_joblib(func=run_msa_tool,
+                                  input_args=[
+                                      self.jackhmmer_uniprot_args,
+                                      ],
+                                  num_threads=self.num_threads)
+
+        
         msa = parsers.parse_stockholm(uniprot_result["sto"])
         msa = msa.truncate(max_seqs=50000)
         all_seq_dict = make_msa_features([msa])
